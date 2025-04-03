@@ -40,7 +40,7 @@ app.use(cors({
     const allowedOrigins = [
       'http://localhost:8080',
       'http://localhost:5000',
-      'https://flow-email-automator.vercel.app' // Update this with your actual Vercel domain when deployed
+      'https://email-flow-automator.vercel.app/' // Update this with your actual Vercel domain when deployed
     ];
     
     // Check if the origin is allowed
