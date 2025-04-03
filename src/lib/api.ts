@@ -2,8 +2,23 @@
  * API service for making requests to the backend
  */
 
-// Get the API URL from environment variables or default to localhost
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
+// Get the API URL based on the environment
+const getApiUrl = () => {
+  // If a specific API URL is set in environment variables, use that
+  if (import.meta.env.VITE_API_URL) {
+    return import.meta.env.VITE_API_URL;
+  }
+  
+  // In production (like Vercel), use the same origin for API calls
+  if (import.meta.env.PROD) {
+    return '';  // Empty string means use the same origin
+  }
+  
+  // Default to localhost for development
+  return 'http://localhost:5000';
+};
+
+const API_URL = getApiUrl();
 
 /**
  * Make a request to the API
@@ -26,7 +41,8 @@ export const apiRequest = async (endpoint: string, options: RequestInit = {}) =>
     }
 
     // Make the request
-    const response = await fetch(`${API_URL}${endpoint}`, {
+    const url = API_URL ? `${API_URL}${endpoint}` : endpoint;
+    const response = await fetch(url, {
       ...options,
       headers,
     });
