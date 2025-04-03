@@ -1,4 +1,4 @@
-# Flow Email Automator
+# Email Scheduler Flow Automator
 
 A visual email sequence builder and automation tool.
 
