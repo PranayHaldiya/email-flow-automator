@@ -13,7 +13,8 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "start": "node src/server/server.js",
-    "start:dev": "node start-server.js"
+    "start:dev": "node start-server.js",
+    "vercel-build": "vite build"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.0",
