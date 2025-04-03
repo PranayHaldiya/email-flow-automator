@@ -36,25 +36,32 @@ app.use(cors({
     // Allow requests with no origin (like mobile apps, curl, etc.)
     if (!origin) return callback(null, true);
     
-    // List of allowed origins (add your Vercel deployment URL once known)
+    // For Vercel deployment, allow API requests from the same domain
+    // Also handle potential www. subdomains and custom domains
+    const vercelDomain = process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : null;
+    
+    // List of allowed origins
     const allowedOrigins = [
       'http://localhost:8080',
       'http://localhost:5000',
-      'https://email-flow-automator.vercel.app/' // Update this with your actual Vercel domain when deployed
-    ];
+      vercelDomain,
+      // Add any custom domains here
+    ].filter(Boolean); // Remove null entries
     
-    // Check if the origin is allowed
-    if (process.env.NODE_ENV === 'production') {
-      // In production, check against allowed origins
-      if (allowedOrigins.indexOf(origin) === -1) {
-        const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
-        return callback(new Error(msg), false);
-      }
-      return callback(null, origin);
-    } else {
-      // In development, allow all origins
+    // In development mode or if origin matches deployment URL, allow it
+    if (process.env.NODE_ENV !== 'production' || 
+        // Check if request comes from the same domain as deployment
+        (origin.startsWith(vercelDomain) || 
+         // Allow the request if it's in our allowed origins
+         allowedOrigins.some(allowed => allowed === origin || 
+                             // Check for domain match regardless of protocol
+                             (allowed && origin.endsWith(allowed.replace(/^https?:\/\//, '')))))) {
       return callback(null, origin);
     }
+    
+    // For all other origins in production, reject them
+    const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
+    return callback(new Error(msg), false);
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
