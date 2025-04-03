@@ -90,18 +90,26 @@ let cachedDb = null;
 async function connectToDatabase() {
   // If we have a cached connection, use it
   if (cachedClient && cachedDb) {
-    // Check if cached client is still connected
+    // Check if cached client is still connected with a proper timeout
     try {
-      await cachedClient.db().admin().ping();
-      console.log('Using cached MongoDB connection');
+      // Use a quick timeout for ping to avoid hanging
+      await Promise.race([
+        cachedClient.db().admin().ping(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Ping timeout')), 2000))
+      ]);
+      
+      // Only log when in non-serverless environment to reduce spam
+      if (!isVercelServerless) {
+        console.log('Using cached MongoDB connection');
+      }
       return { client: cachedClient, db: cachedDb };
     } catch (error) {
-      console.log('Cached MongoDB connection is stale, creating a new one');
-      // Connection is stale, close it and create a new one
+      console.log(`Connection check failed: ${error.message}. Creating a new one...`);
+      // Connection is stale, close it safely and create a new one
       try {
-        await cachedClient.close();
+        await cachedClient.close(true);
       } catch (closeError) {
-        // Ignore close errors
+        console.log('Error closing stale connection:', closeError.message);
       }
       cachedClient = null;
       cachedDb = null;
@@ -109,7 +117,7 @@ async function connectToDatabase() {
   }
 
   // If no cached connection, create a new one
-  console.log('Creating new MongoDB connection');
+  console.log(`[${new Date().toISOString()}] Creating new MongoDB connection`);
   
   // Connection options optimized for serverless
   const options = {
@@ -118,9 +126,7 @@ async function connectToDatabase() {
     socketTimeoutMS: 30000,
     maxPoolSize: 10,
     minPoolSize: 1,
-    retryWrites: true,
-    keepAlive: true,
-    keepAliveInitialDelay: 30000
+    retryWrites: true
   };
 
   try {
@@ -133,7 +139,7 @@ async function connectToDatabase() {
     cachedClient = client;
     cachedDb = db;
     
-    console.log('MongoDB connection established successfully');
+    console.log(`[${new Date().toISOString()}] MongoDB connection established successfully`);
     return { client, db };
   } catch (error) {
     console.error('Error connecting to MongoDB:', error.message);
@@ -144,20 +150,44 @@ async function connectToDatabase() {
 // Declare agenda variable to be initialized after MongoDB connection
 let agenda;
 
+// Add this below the declaration of agenda variable
+let agendaInitialized = false;
+
+// Now fix the Nodemailer transporter with better debugging
+let transporter = null;
+
 /**
- * Configure Nodemailer for email sending
- * - Uses environment variables for SMTP credentials
- * - Fallback to Gmail SMTP if not provided
+ * Initialize the email transporter with the current settings
  */
-let transporter = nodemailer.createTransport({
-  host: process.env.EMAIL_HOST || 'smtp.gmail.com',
-  port: process.env.EMAIL_PORT || 587,
-  secure: false,
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS
+function initializeTransporter() {
+  if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+    console.error('EMAIL_USER or EMAIL_PASS is not set in environment variables');
+    return false;
   }
-});
+
+  try {
+    console.log(`Setting up email transporter with ${process.env.EMAIL_USER} via ${process.env.EMAIL_HOST || 'smtp.gmail.com'}`);
+    
+    transporter = nodemailer.createTransport({
+      host: process.env.EMAIL_HOST || 'smtp.gmail.com',
+      port: parseInt(process.env.EMAIL_PORT || '587', 10),
+      secure: process.env.EMAIL_SECURE === 'true',
+      auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS
+      },
+      debug: true // Enable debug output
+    });
+    
+    return true;
+  } catch (error) {
+    console.error('Failed to create email transporter:', error);
+    return false;
+  }
+}
+
+// Initialize transporter on startup
+initializeTransporter();
 
 // Authentication routes - no JWT required
 app.post('/api/register', registerUser);
@@ -633,30 +663,31 @@ app.delete('/api/templates/:id', authenticateJWT, async (req, res) => {
 });
 
 /**
- * Initialize Agenda scheduling system
+ * Initialize Agenda scheduling system with improved connection handling
  */
 const initializeAgenda = async () => {
   if (!MONGODB_URI) {
     throw new Error('MONGODB_URI is not defined in environment variables');
   }
   
-  // If agenda is already initialized, return
-  if (agenda) {
-    console.log('Agenda is already initialized');
-    return;
+  // If agenda is already initialized, return it
+  if (agenda && agendaInitialized) {
+    console.log('Using existing Agenda instance');
+    return agenda;
   }
   
   try {
-    console.log('Initializing Agenda with MongoDB connection');
+    console.log(`[${new Date().toISOString()}] Initializing Agenda with MongoDB connection`);
     
-    // Try to get the cached MongoDB connection
+    // Get the cached MongoDB connection - ensures one connection is maintained
     const { db } = await connectToDatabase();
     
     // Create a new Agenda instance with the database connection
     agenda = new Agenda({
       mongo: db,
       collection: 'emailJobs',
-      processEvery: '1 minute'
+      processEvery: '20 seconds',
+      defaultConcurrency: 5
     });
 
     // Define Agenda job for sending emails
@@ -664,6 +695,29 @@ const initializeAgenda = async () => {
       const { to, subject, body, userId } = job.attrs.data;
       
       try {
+        console.log(`[${new Date().toISOString()}] Attempting to send email to ${to} with subject "${subject}"`);
+        
+        // Verify we have a transporter
+        if (!transporter) {
+          console.log('Transporter not available, initializing...');
+          if (!initializeTransporter()) {
+            throw new Error('Failed to initialize email transporter');
+          }
+        }
+        
+        // Verify transporter is working with a test
+        await new Promise((resolve, reject) => {
+          transporter.verify(function (error) {
+            if (error) {
+              console.error('Transporter verification failed:', error);
+              reject(error);
+            } else {
+              console.log('Transporter is ready to send messages');
+              resolve();
+            }
+          });
+        });
+
         const info = await transporter.sendMail({
           from: process.env.EMAIL_USER,
           to,
@@ -673,18 +727,26 @@ const initializeAgenda = async () => {
         });
 
         console.log(`Email sent: ${info.messageId} by user ${userId}`);
+        console.log('Email response:', JSON.stringify(info));
         return info;
       } catch (error) {
-        console.error('Error sending email:', error);
+        console.error(`Error sending email to ${to}:`, error);
+        
+        // Try to reinitialize the transporter on error
+        console.log('Attempting to reinitialize email transporter...');
+        initializeTransporter();
+        
         throw error;
       }
     });
 
     await agenda.start();
     console.log('Agenda started successfully');
+    agendaInitialized = true;
     return agenda;
   } catch (error) {
     console.error('Failed to initialize Agenda:', error);
+    agendaInitialized = false;
     throw error;
   }
 };
@@ -705,12 +767,32 @@ const initializeAgenda = async () => {
  */
 app.post('/api/schedule-email', authenticateJWT, async (req, res) => {
   try {
+    console.log(`[${new Date().toISOString()}] Received request to schedule email`);
+    
+    // First, verify email settings are configured
+    if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+      console.error('EMAIL_USER or EMAIL_PASS is not set in environment variables');
+      return res.status(500).json({ 
+        error: 'Email configuration is missing', 
+        details: 'The server is not configured with valid email credentials'
+      });
+    }
+    
+    // Make sure Agenda is initialized before using it
+    if (!agenda || !agendaInitialized) {
+      console.log('Agenda not initialized, initializing now...');
+      await initializeAgenda();
+    }
+    
     if (!agenda) {
+      console.error('Failed to initialize Agenda');
       return res.status(503).json({ error: 'Scheduling service is not available' });
     }
     
     const { to, subject, body, delay, unit } = req.body;
     const userId = req.user.id;
+    
+    console.log(`Scheduling email to: ${to}, subject: ${subject}, delay: ${delay} ${unit}`);
     
     // Calculate when to send the email
     let sendTime = new Date();
@@ -722,18 +804,74 @@ app.post('/api/schedule-email', authenticateJWT, async (req, res) => {
       sendTime.setDate(sendTime.getDate() + delay);
     }
     
-    // Schedule the job
-    await agenda.schedule(sendTime, 'send email', {
-      to,
-      subject,
-      body,
-      userId
-    });
+    console.log(`Email will be sent at: ${sendTime.toISOString()}`);
     
-    res.status(200).json({ message: 'Email scheduled successfully', scheduledFor: sendTime });
+    try {
+      // Make sure we have a database connection for agenda operations
+      await connectToDatabase();
+      
+      // Verify transporter is working
+      if (!transporter) {
+        console.log('Email transporter not initialized, initializing now...');
+        if (!initializeTransporter()) {
+          return res.status(500).json({ error: 'Failed to initialize email service' });
+        }
+      }
+      
+      // Schedule the job
+      const job = await agenda.schedule(sendTime, 'send email', {
+        to,
+        subject,
+        body,
+        userId
+      });
+      
+      console.log(`Job scheduled with ID: ${job.attrs._id}`);
+      
+      // Verify the job was scheduled by checking it exists in the database
+      const { db } = await connectToDatabase();
+      const jobsCollection = db.collection('emailJobs');
+      const scheduledJob = await jobsCollection.findOne({ _id: job.attrs._id });
+      
+      if (!scheduledJob) {
+        console.error('Job was not found in the database after scheduling');
+        return res.status(500).json({ error: 'Failed to verify job was scheduled' });
+      }
+      
+      console.log('Email scheduling verified in database');
+      res.status(200).json({ 
+        message: 'Email scheduled successfully', 
+        scheduledFor: sendTime,
+        jobId: job.attrs._id.toString()
+      });
+    } catch (err) {
+      console.error('Error scheduling email:', err);
+      
+      // If there's a connection error, try to reinitialize Agenda
+      if (err.name === 'MongoNotConnectedError') {
+        console.log('Attempting to reconnect to MongoDB for Agenda...');
+        await initializeAgenda();
+        
+        // Try to schedule the email again after reconnection
+        const job = await agenda.schedule(sendTime, 'send email', {
+          to,
+          subject,
+          body,
+          userId
+        });
+        
+        res.status(200).json({ 
+          message: 'Email scheduled successfully after reconnection', 
+          scheduledFor: sendTime,
+          jobId: job.attrs._id.toString()
+        });
+      } else {
+        throw err; // Re-throw if it's not a connection error
+      }
+    }
   } catch (error) {
     console.error('Error scheduling email:', error);
-    res.status(500).json({ error: 'Failed to schedule email' });
+    res.status(500).json({ error: 'Failed to schedule email', details: error.message });
   }
 });
 
@@ -747,6 +885,11 @@ app.post('/api/schedule-email', authenticateJWT, async (req, res) => {
  */
 app.post('/api/schedule-sequence', authenticateJWT, async (req, res) => {
   try {
+    // Make sure Agenda is initialized before using it
+    if (!agenda || !agendaInitialized) {
+      await initializeAgenda();
+    }
+    
     if (!agenda) {
       return res.status(503).json({ error: 'Scheduling service is not available' });
     }
@@ -761,6 +904,9 @@ app.post('/api/schedule-sequence', authenticateJWT, async (req, res) => {
       let hasMissingRecipients = false;
       
       console.log('Immediate send mode selected. Processing sequence with', sequence.length, 'items');
+      
+      // Make sure we have a database connection for agenda operations
+      await connectToDatabase();
       
       for (const item of sequence) {
         if (item.type === 'coldEmail') {
@@ -782,7 +928,7 @@ app.post('/api/schedule-sequence', authenticateJWT, async (req, res) => {
           sendTime.setMinutes(sendTime.getMinutes() + 1);  // Add a minute to ensure it's in the future
           
           try {
-            // Schedule the email
+            // Schedule the email with error handling
             await agenda.schedule(sendTime, 'send email', {
               to: item.data.recipient,
               subject: item.data.subject || 'No Subject',
@@ -799,6 +945,32 @@ app.post('/api/schedule-sequence', authenticateJWT, async (req, res) => {
             console.log('Successfully scheduled immediate email to:', item.data.recipient);
           } catch (err) {
             console.error('Error scheduling individual email:', err);
+            
+            // If there's a connection error, try to reinitialize Agenda
+            if (err.name === 'MongoNotConnectedError') {
+              console.log('Attempting to reconnect to MongoDB for Agenda...');
+              await initializeAgenda();
+              
+              // Try to schedule the email again after reconnection
+              try {
+                await agenda.schedule(sendTime, 'send email', {
+                  to: item.data.recipient,
+                  subject: item.data.subject || 'No Subject',
+                  body: item.data.body || '',
+                  userId
+                });
+                
+                scheduledEmails.push({
+                  email: item.data.recipient,
+                  subject: item.data.subject || 'No Subject',
+                  scheduledFor: sendTime
+                });
+                
+                console.log('Successfully scheduled email after reconnection');
+              } catch (retryErr) {
+                console.error('Failed to schedule email after reconnection:', retryErr);
+              }
+            }
           }
         }
       }
@@ -927,6 +1099,11 @@ app.post('/api/schedule-sequence', authenticateJWT, async (req, res) => {
  * @returns {Object} Scheduled time information
  */
 async function scheduleEmail({ to, subject, body, delay, unit, userId }) {
+  // Make sure Agenda is initialized before using it
+  if (!agenda || !agendaInitialized) {
+    await initializeAgenda();
+  }
+  
   if (!agenda) {
     throw new Error('Scheduling service is not available');
   }
@@ -940,19 +1117,92 @@ async function scheduleEmail({ to, subject, body, delay, unit, userId }) {
     sendTime.setDate(sendTime.getDate() + delay);
   }
   
-  await agenda.schedule(sendTime, 'send email', {
-    to,
-    subject,
-    body,
-    userId
-  });
-  
-  return { scheduledFor: sendTime };
+  try {
+    // Make sure we have a database connection for agenda operations
+    await connectToDatabase();
+    
+    await agenda.schedule(sendTime, 'send email', {
+      to,
+      subject,
+      body,
+      userId
+    });
+    
+    return { scheduledFor: sendTime };
+  } catch (err) {
+    console.error('Error in scheduleEmail helper:', err);
+    
+    // If there's a connection error, try to reinitialize Agenda
+    if (err.name === 'MongoNotConnectedError') {
+      console.log('Attempting to reconnect to MongoDB for Agenda...');
+      await initializeAgenda();
+      
+      // Try to schedule the email again after reconnection
+      await agenda.schedule(sendTime, 'send email', {
+        to,
+        subject,
+        body,
+        userId
+      });
+      
+      return { scheduledFor: sendTime, reconnected: true };
+    }
+    
+    throw err; // Re-throw if it's not a connection error we can handle
+  }
 }
 
-/**
- * Start the server and connect to MongoDB
- */
+// Add a job completion listener to monitor job execution
+if (agenda) {
+  agenda.on('complete', job => {
+    console.log(`Job ${job.attrs.name} completed for ${job.attrs.data.to}`);
+  });
+
+  agenda.on('fail', (error, job) => {
+    console.error(`Job ${job.attrs.name} failed with error:`, error);
+  });
+  
+  // Add a periodic check for pending jobs to ensure processing is working
+  setInterval(async () => {
+    if (agenda && agendaInitialized) {
+      try {
+        // Connect to the database
+        const { db } = await connectToDatabase();
+        const jobsCollection = db.collection('emailJobs');
+        
+        // Find pending jobs
+        const pendingJobs = await jobsCollection.countDocuments({
+          nextRunAt: { $ne: null },
+          lockedAt: null
+        });
+        
+        if (pendingJobs > 0) {
+          console.log(`[${new Date().toISOString()}] Found ${pendingJobs} pending jobs waiting to be processed`);
+        }
+        
+        // Find locked jobs that might be stuck
+        const lockedJobs = await jobsCollection.countDocuments({
+          lockedAt: { $ne: null }
+        });
+        
+        if (lockedJobs > 0) {
+          console.log(`[${new Date().toISOString()}] Found ${lockedJobs} locked jobs that might be stuck`);
+          
+          // If we find locked jobs older than 5 minutes, unlock them
+          const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+          await jobsCollection.updateMany(
+            { lockedAt: { $lt: fiveMinutesAgo } },
+            { $set: { lockedAt: null } }
+          );
+        }
+      } catch (error) {
+        console.error('Error checking job status:', error);
+      }
+    }
+  }, 60000); // Check every minute
+}
+
+// Update the start function to better monitor Agenda's status
 const start = async () => {
   // Only start the Express server listener if not in serverless mode
   if (!isVercelServerless) {
@@ -982,8 +1232,62 @@ const start = async () => {
       const collections = await db.listCollections().toArray();
       console.log(`Connected to database with ${collections.length} collections`);
       
+      // Check if emailJobs collection exists and log job count
+      if (collections.some(c => c.name === 'emailJobs')) {
+        const jobsCollection = db.collection('emailJobs');
+        const jobCount = await jobsCollection.countDocuments();
+        console.log(`Found ${jobCount} email jobs in the database`);
+        
+        // Check for pending jobs
+        const pendingJobs = await jobsCollection.countDocuments({
+          nextRunAt: { $ne: null },
+          lockedAt: null
+        });
+        
+        console.log(`Found ${pendingJobs} pending jobs to be processed`);
+      }
+      
       // Only initialize Agenda if MongoDB connected successfully
-      await initializeAgenda();
+      try {
+        const agendaInstance = await initializeAgenda();
+        if (agendaInstance) {
+          console.log('Agenda initialized successfully during startup');
+          
+          // Check if the email configuration is valid
+          if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+            console.error('⚠️ WARNING: EMAIL_USER or EMAIL_PASS is not set. Emails will not be sent!');
+          } else {
+            console.log(`Email configured for: ${process.env.EMAIL_USER}`);
+            
+            // Test the email connection
+            if (!transporter) {
+              initializeTransporter();
+            }
+            
+            if (transporter) {
+              try {
+                await new Promise((resolve, reject) => {
+                  transporter.verify(function (error) {
+                    if (error) {
+                      console.error('⚠️ Email transporter verification failed:', error);
+                      reject(error);
+                    } else {
+                      console.log('✅ Email transporter is ready to send messages');
+                      resolve();
+                    }
+                  });
+                });
+              } catch (emailError) {
+                console.error('Email service is not properly configured:', emailError.message);
+              }
+            }
+          }
+        }
+      } catch (agendaError) {
+        console.error('Failed to initialize Agenda during startup:', agendaError.message);
+        // Continue running the server even if Agenda failed to initialize
+        // We'll retry when a scheduling operation is attempted
+      }
     } catch (dbError) {
       console.error('Database operation error:', dbError.message);
       
@@ -1020,5 +1324,160 @@ if (isVercelServerless) {
   // Regular environment - start everything
   start();
 }
+
+/**
+ * API endpoint to diagnose email issues
+ * @route GET /api/diagnose-email
+ * @returns {Object} Diagnostic information
+ */
+app.get('/api/diagnose-email', async (req, res) => {
+  try {
+    console.log(`[${new Date().toISOString()}] Starting email diagnostics`);
+    
+    const diagnosticResults = {
+      email: {
+        configured: false,
+        username: process.env.EMAIL_USER ? 'Set' : 'Not Set',
+        password: process.env.EMAIL_PASS ? 'Set' : 'Not Set',
+        host: process.env.EMAIL_HOST || 'Not Set',
+        port: process.env.EMAIL_PORT || 'Not Set',
+        verifyResult: null
+      },
+      agenda: {
+        initialized: agendaInitialized,
+        jobsInQueue: 0,
+        pendingJobs: 0
+      },
+      mongodb: {
+        connected: false,
+        collections: []
+      }
+    };
+    
+    // Test MongoDB connection
+    try {
+      const { db } = await connectToDatabase();
+      diagnosticResults.mongodb.connected = true;
+      
+      // Get collections
+      const collections = await db.listCollections().toArray();
+      diagnosticResults.mongodb.collections = collections.map(c => c.name);
+      
+      // Check for pending jobs
+      if (collections.some(c => c.name === 'emailJobs')) {
+        const jobsCollection = db.collection('emailJobs');
+        diagnosticResults.agenda.jobsInQueue = await jobsCollection.countDocuments();
+        diagnosticResults.agenda.pendingJobs = await jobsCollection.countDocuments({
+          nextRunAt: { $ne: null },
+          lockedAt: null
+        });
+      }
+    } catch (dbError) {
+      console.error('Diagnostic MongoDB check failed:', dbError);
+    }
+    
+    // Test email configuration
+    if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+      diagnosticResults.email.configured = true;
+      
+      // Initialize transporter if needed
+      if (!transporter) {
+        initializeTransporter();
+      }
+      
+      // Verify email connection
+      try {
+        const verifyResult = await new Promise((resolve) => {
+          transporter.verify(function(error, success) {
+            if (error) {
+              resolve({ success: false, error: error.message });
+            } else {
+              resolve({ success: true });
+            }
+          });
+        });
+        
+        diagnosticResults.email.verifyResult = verifyResult;
+      } catch (emailError) {
+        diagnosticResults.email.verifyResult = { 
+          success: false, 
+          error: emailError.message 
+        };
+      }
+    }
+    
+    res.status(200).json({
+      timestamp: new Date().toISOString(),
+      diagnostics: diagnosticResults,
+      isVercelServerless: isVercelServerless,
+      environmentVariables: {
+        NODE_ENV: process.env.NODE_ENV,
+        PORT: process.env.PORT,
+        MONGODB_URI_SET: !!process.env.MONGODB_URI,
+        EMAIL_HOST_SET: !!process.env.EMAIL_HOST,
+        EMAIL_USER_SET: !!process.env.EMAIL_USER,
+        EMAIL_PASS_SET: !!process.env.EMAIL_PASS
+      }
+    });
+  } catch (error) {
+    console.error('Email diagnostic error:', error);
+    res.status(500).json({ error: 'Diagnostic failed', details: error.message });
+  }
+});
+
+/**
+ * API endpoint to send a test email
+ * @route POST /api/test-email
+ * @param {string} to - Email recipient
+ * @returns {Object} Test result
+ */
+app.post('/api/test-email', async (req, res) => {
+  try {
+    const { to } = req.body;
+    
+    if (!to) {
+      return res.status(400).json({ error: 'Email recipient is required' });
+    }
+    
+    // Initialize email transporter if needed
+    if (!transporter) {
+      console.log('Initializing email transporter for test...');
+      if (!initializeTransporter()) {
+        return res.status(500).json({ 
+          error: 'Failed to initialize email service',
+          details: 'Check your EMAIL_USER and EMAIL_PASS environment variables'
+        });
+      }
+    }
+    
+    console.log(`Sending test email to ${to}...`);
+    
+    // Try to send a test email
+    const info = await transporter.sendMail({
+      from: process.env.EMAIL_USER,
+      to: to,
+      subject: 'Test Email from Flow Email Automator',
+      text: 'This is a test email from your Flow Email Automator application.',
+      html: '<div><h2>Test Email</h2><p>This is a test email from your Flow Email Automator application.</p></div>'
+    });
+    
+    console.log('Test email sent:', info.messageId);
+    
+    res.status(200).json({
+      success: true,
+      messageId: info.messageId,
+      response: info.response,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Test email error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to send test email',
+      details: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
 
 export default app;
