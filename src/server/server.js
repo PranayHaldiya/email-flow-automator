@@ -90,8 +90,22 @@ let cachedDb = null;
 async function connectToDatabase() {
   // If we have a cached connection, use it
   if (cachedClient && cachedDb) {
-    console.log('Using cached MongoDB connection');
-    return { client: cachedClient, db: cachedDb };
+    // Check if cached client is still connected
+    try {
+      await cachedClient.db().admin().ping();
+      console.log('Using cached MongoDB connection');
+      return { client: cachedClient, db: cachedDb };
+    } catch (error) {
+      console.log('Cached MongoDB connection is stale, creating a new one');
+      // Connection is stale, close it and create a new one
+      try {
+        await cachedClient.close();
+      } catch (closeError) {
+        // Ignore close errors
+      }
+      cachedClient = null;
+      cachedDb = null;
+    }
   }
 
   // If no cached connection, create a new one
@@ -99,24 +113,32 @@ async function connectToDatabase() {
   
   // Connection options optimized for serverless
   const options = {
-    serverSelectionTimeoutMS: 5000,
+    serverSelectionTimeoutMS: 10000,
     connectTimeoutMS: 10000,
     socketTimeoutMS: 30000,
     maxPoolSize: 10,
     minPoolSize: 1,
     retryWrites: true,
+    keepAlive: true,
+    keepAliveInitialDelay: 30000
   };
 
-  // Connect to database
-  const client = new MongoClient(MONGODB_URI, options);
-  await client.connect();
-  const db = client.db();
-  
-  // Cache the connection
-  cachedClient = client;
-  cachedDb = db;
-  
-  return { client, db };
+  try {
+    // Connect to database
+    const client = new MongoClient(MONGODB_URI, options);
+    await client.connect();
+    const db = client.db();
+    
+    // Cache the connection
+    cachedClient = client;
+    cachedDb = db;
+    
+    console.log('MongoDB connection established successfully');
+    return { client, db };
+  } catch (error) {
+    console.error('Error connecting to MongoDB:', error.message);
+    throw error;
+  }
 }
 
 // Declare agenda variable to be initialized after MongoDB connection
@@ -141,10 +163,40 @@ let transporter = nodemailer.createTransport({
 app.post('/api/register', registerUser);
 app.post('/api/login', loginUser);
 
-// Simple health check endpoint
-app.get('/api/health', (req, res) => {
-  res.status(200).json({ status: 'Server is running', databaseConnected: !!agenda });
+// Update the health check endpoint
+app.get('/api/health', async (req, res) => {
+  let dbConnected = false;
+  
+  try {
+    // Try to connect to MongoDB
+    const { client, db } = await connectToDatabase();
+    
+    // Ping the database to verify connection
+    await db.command({ ping: 1 });
+    dbConnected = true;
+    
+    if (shouldCloseClient()) {
+      await client.close();
+    }
+  } catch (error) {
+    console.error('Health check failed to connect to database:', error.message);
+    dbConnected = false;
+  }
+  
+  res.status(200).json({ 
+    status: 'Server is running', 
+    databaseConnected: dbConnected,
+    serverless: isVercelServerless 
+  });
 });
+
+/**
+ * Helper function to decide whether to close MongoDB client or keep it open
+ * In serverless environments, we keep the connection open for reuse
+ */
+function shouldCloseClient() {
+  return !isVercelServerless; // Only close in non-serverless environments
+}
 
 /**
  * API endpoint to save a flow configuration
@@ -177,7 +229,10 @@ app.post('/api/flows', authenticateJWT, async (req, res) => {
       updatedAt: new Date()
     });
     
-    await client.close();
+    // Only close the client if not in serverless environment
+    if (shouldCloseClient()) {
+      await client.close();
+    }
     
     res.status(201).json({
       message: 'Flow saved successfully',
@@ -213,12 +268,16 @@ app.put('/api/flows/:id', authenticateJWT, async (req, res) => {
     const flow = await flowsCollection.findOne({ _id: new ObjectId(id) });
     
     if (!flow) {
-      await client.close();
+      if (shouldCloseClient()) {
+        await client.close();
+      }
       return res.status(404).json({ error: 'Flow not found' });
     }
     
     if (flow.userId !== userId) {
-      await client.close();
+      if (shouldCloseClient()) {
+        await client.close();
+      }
       return res.status(403).json({ error: 'Not authorized to modify this flow' });
     }
     
@@ -235,7 +294,9 @@ app.put('/api/flows/:id', authenticateJWT, async (req, res) => {
       }
     );
     
-    await client.close();
+    if (shouldCloseClient()) {
+      await client.close();
+    }
     
     res.status(200).json({
       message: 'Flow updated successfully',
@@ -264,7 +325,9 @@ app.get('/api/flows', authenticateJWT, async (req, res) => {
     // Get all flows for the user
     const flows = await flowsCollection.find({ userId }).sort({ updatedAt: -1 }).toArray();
     
-    await client.close();
+    if (shouldCloseClient()) {
+      await client.close();
+    }
     
     res.status(200).json({
       flows: flows.map(flow => ({
@@ -298,7 +361,9 @@ app.get('/api/flows/:id', authenticateJWT, async (req, res) => {
     // Find the flow and verify ownership
     const flow = await flowsCollection.findOne({ _id: new ObjectId(id) });
     
-    await client.close();
+    if (shouldCloseClient()) {
+      await client.close();
+    }
     
     if (!flow) {
       return res.status(404).json({ error: 'Flow not found' });
@@ -341,19 +406,25 @@ app.delete('/api/flows/:id', authenticateJWT, async (req, res) => {
     const flow = await flowsCollection.findOne({ _id: new ObjectId(id) });
     
     if (!flow) {
-      await client.close();
+      if (shouldCloseClient()) {
+        await client.close();
+      }
       return res.status(404).json({ error: 'Flow not found' });
     }
     
     if (flow.userId !== userId) {
-      await client.close();
+      if (shouldCloseClient()) {
+        await client.close();
+      }
       return res.status(403).json({ error: 'Not authorized to delete this flow' });
     }
     
     // Delete the flow
     await flowsCollection.deleteOne({ _id: new ObjectId(id) });
     
-    await client.close();
+    if (shouldCloseClient()) {
+      await client.close();
+    }
     
     res.status(200).json({
       message: 'Flow deleted successfully',
@@ -396,7 +467,9 @@ app.post('/api/templates', authenticateJWT, async (req, res) => {
       updatedAt: new Date()
     });
     
-    await client.close();
+    if (shouldCloseClient()) {
+      await client.close();
+    }
     
     res.status(201).json({
       message: 'Email template saved successfully',
@@ -428,7 +501,9 @@ app.get('/api/templates', authenticateJWT, async (req, res) => {
       .sort({ updatedAt: -1 })
       .toArray();
     
-    await client.close();
+    if (shouldCloseClient()) {
+      await client.close();
+    }
     
     // Map MongoDB _id to id for frontend consumption
     const mappedTemplates = templates.map(template => ({
@@ -473,16 +548,22 @@ app.get('/api/templates/:id', authenticateJWT, async (req, res) => {
     const template = await templatesCollection.findOne({ _id: objectId });
     
     if (!template) {
-      await client.close();
+      if (shouldCloseClient()) {
+        await client.close();
+      }
       return res.status(404).json({ error: 'Template not found' });
     }
     
     if (template.userId !== userId) {
-      await client.close();
+      if (shouldCloseClient()) {
+        await client.close();
+      }
       return res.status(403).json({ error: 'Not authorized to access this template' });
     }
     
-    await client.close();
+    if (shouldCloseClient()) {
+      await client.close();
+    }
     
     // Include id for frontend consumption
     const mappedTemplate = {
@@ -524,19 +605,25 @@ app.delete('/api/templates/:id', authenticateJWT, async (req, res) => {
     const template = await templatesCollection.findOne({ _id: objectId });
     
     if (!template) {
-      await client.close();
+      if (shouldCloseClient()) {
+        await client.close();
+      }
       return res.status(404).json({ error: 'Template not found' });
     }
     
     if (template.userId !== userId) {
-      await client.close();
+      if (shouldCloseClient()) {
+        await client.close();
+      }
       return res.status(403).json({ error: 'Not authorized to delete this template' });
     }
     
     // Delete the template
     await templatesCollection.deleteOne({ _id: objectId });
     
-    await client.close();
+    if (shouldCloseClient()) {
+      await client.close();
+    }
     
     res.status(200).json({ message: 'Template deleted successfully' });
   } catch (error) {
