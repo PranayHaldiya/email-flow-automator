@@ -36,8 +36,25 @@ app.use(cors({
     // Allow requests with no origin (like mobile apps, curl, etc.)
     if (!origin) return callback(null, true);
     
-    // Allow all origins for development
-    return callback(null, origin);
+    // List of allowed origins (add your Vercel deployment URL once known)
+    const allowedOrigins = [
+      'http://localhost:8080',
+      'http://localhost:5000',
+      'https://flow-email-automator.vercel.app' // Update this with your actual Vercel domain when deployed
+    ];
+    
+    // Check if the origin is allowed
+    if (process.env.NODE_ENV === 'production') {
+      // In production, check against allowed origins
+      if (allowedOrigins.indexOf(origin) === -1) {
+        const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
+        return callback(new Error(msg), false);
+      }
+      return callback(null, origin);
+    } else {
+      // In development, allow all origins
+      return callback(null, origin);
+    }
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
@@ -799,10 +816,15 @@ async function scheduleEmail({ to, subject, body, delay, unit, userId }) {
  * Start the server and connect to MongoDB
  */
 const start = async () => {
-  // Start Express server first
-  app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
-  });
+  // Only start the server if not running in a serverless environment (Vercel)
+  if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
+    // Start Express server first
+    app.listen(PORT, () => {
+      console.log(`Server is running on port ${PORT}`);
+    });
+  } else {
+    console.log('Running in serverless mode on Vercel');
+  }
   
   // Try to connect to MongoDB and initialize Agenda
   try {
@@ -856,6 +878,15 @@ const start = async () => {
   }
 };
 
-start();
+// In serverless environment, just export the app
+if (process.env.NODE_ENV === 'production' && process.env.VERCEL) {
+  // Connect to MongoDB without starting Express server
+  start().catch(error => {
+    console.error('Error in serverless initialization:', error);
+  });
+} else {
+  // Regular environment - start everything
+  start();
+}
 
 export default app;
