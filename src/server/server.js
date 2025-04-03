@@ -9,6 +9,9 @@ import { fileURLToPath } from 'url';
 import { authenticateJWT } from './auth.js';
 import { registerUser, loginUser } from './users.js';
 
+// Check if running on Vercel serverless environment
+const isVercelServerless = process.env.VERCEL === '1';
+
 // Get directory name in ES Module
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -21,6 +24,7 @@ console.log("Environment variables:");
 console.log("PORT:", process.env.PORT);
 console.log("MONGODB_URI exists:", !!process.env.MONGODB_URI);
 console.log("EMAIL_HOST:", process.env.EMAIL_HOST);
+console.log("Running on Vercel:", isVercelServerless ? "Yes" : "No");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -76,6 +80,45 @@ app.use(express.json());
 // MongoDB connection string from environment variables
 const MONGODB_URI = process.env.MONGODB_URI;
 
+// Create a cached connection variable for serverless environment
+let cachedClient = null;
+let cachedDb = null;
+
+/**
+ * Connect to MongoDB with connection caching for serverless environments
+ */
+async function connectToDatabase() {
+  // If we have a cached connection, use it
+  if (cachedClient && cachedDb) {
+    console.log('Using cached MongoDB connection');
+    return { client: cachedClient, db: cachedDb };
+  }
+
+  // If no cached connection, create a new one
+  console.log('Creating new MongoDB connection');
+  
+  // Connection options optimized for serverless
+  const options = {
+    serverSelectionTimeoutMS: 5000,
+    connectTimeoutMS: 10000,
+    socketTimeoutMS: 30000,
+    maxPoolSize: 10,
+    minPoolSize: 1,
+    retryWrites: true,
+  };
+
+  // Connect to database
+  const client = new MongoClient(MONGODB_URI, options);
+  await client.connect();
+  const db = client.db();
+  
+  // Cache the connection
+  cachedClient = client;
+  cachedDb = db;
+  
+  return { client, db };
+}
+
 // Declare agenda variable to be initialized after MongoDB connection
 let agenda;
 
@@ -121,9 +164,7 @@ app.post('/api/flows', authenticateJWT, async (req, res) => {
     }
     
     // Connect to MongoDB
-    const client = new MongoClient(MONGODB_URI);
-    await client.connect();
-    const db = client.db();
+    const { client, db } = await connectToDatabase();
     const flowsCollection = db.collection('flows');
     
     // Save the flow
@@ -165,9 +206,7 @@ app.put('/api/flows/:id', authenticateJWT, async (req, res) => {
     const userId = req.user.id;
     
     // Connect to MongoDB
-    const client = new MongoClient(MONGODB_URI);
-    await client.connect();
-    const db = client.db();
+    const { client, db } = await connectToDatabase();
     const flowsCollection = db.collection('flows');
     
     // Find the flow and verify ownership
@@ -219,9 +258,7 @@ app.get('/api/flows', authenticateJWT, async (req, res) => {
     const userId = req.user.id;
     
     // Connect to MongoDB
-    const client = new MongoClient(MONGODB_URI);
-    await client.connect();
-    const db = client.db();
+    const { client, db } = await connectToDatabase();
     const flowsCollection = db.collection('flows');
     
     // Get all flows for the user
@@ -255,9 +292,7 @@ app.get('/api/flows/:id', authenticateJWT, async (req, res) => {
     const userId = req.user.id;
     
     // Connect to MongoDB
-    const client = new MongoClient(MONGODB_URI);
-    await client.connect();
-    const db = client.db();
+    const { client, db } = await connectToDatabase();
     const flowsCollection = db.collection('flows');
     
     // Find the flow and verify ownership
@@ -299,9 +334,7 @@ app.delete('/api/flows/:id', authenticateJWT, async (req, res) => {
     const userId = req.user.id;
     
     // Connect to MongoDB
-    const client = new MongoClient(MONGODB_URI);
-    await client.connect();
-    const db = client.db();
+    const { client, db } = await connectToDatabase();
     const flowsCollection = db.collection('flows');
     
     // Find the flow and verify ownership
@@ -350,9 +383,7 @@ app.post('/api/templates', authenticateJWT, async (req, res) => {
     }
     
     // Connect to MongoDB
-    const client = new MongoClient(MONGODB_URI);
-    await client.connect();
-    const db = client.db();
+    const { client, db } = await connectToDatabase();
     const templatesCollection = db.collection('emailTemplates');
     
     // Save the template
@@ -388,9 +419,7 @@ app.get('/api/templates', authenticateJWT, async (req, res) => {
     const userId = req.user.id;
     
     // Connect to MongoDB
-    const client = new MongoClient(MONGODB_URI);
-    await client.connect();
-    const db = client.db();
+    const { client, db } = await connectToDatabase();
     const templatesCollection = db.collection('emailTemplates');
     
     // Get all templates for the user
@@ -437,9 +466,7 @@ app.get('/api/templates/:id', authenticateJWT, async (req, res) => {
     }
     
     // Connect to MongoDB
-    const client = new MongoClient(MONGODB_URI);
-    await client.connect();
-    const db = client.db();
+    const { client, db } = await connectToDatabase();
     const templatesCollection = db.collection('emailTemplates');
     
     // Find the template
@@ -490,9 +517,7 @@ app.delete('/api/templates/:id', authenticateJWT, async (req, res) => {
     }
     
     // Connect to MongoDB
-    const client = new MongoClient(MONGODB_URI);
-    await client.connect();
-    const db = client.db();
+    const { client, db } = await connectToDatabase();
     const templatesCollection = db.collection('emailTemplates');
     
     // Find the template and verify ownership
@@ -521,41 +546,60 @@ app.delete('/api/templates/:id', authenticateJWT, async (req, res) => {
 });
 
 /**
- * Initialize Agenda and define email job
+ * Initialize Agenda scheduling system
  */
 const initializeAgenda = async () => {
   if (!MONGODB_URI) {
     throw new Error('MONGODB_URI is not defined in environment variables');
   }
   
-  agenda = new Agenda({
-    db: { address: MONGODB_URI, collection: 'emailJobs' },
-    processEvery: '1 minute'
-  });
-
-  // Define Agenda job for sending emails
-  agenda.define('send email', async (job) => {
-    const { to, subject, body, userId } = job.attrs.data;
+  // If agenda is already initialized, return
+  if (agenda) {
+    console.log('Agenda is already initialized');
+    return;
+  }
+  
+  try {
+    console.log('Initializing Agenda with MongoDB connection');
     
-    try {
-      const info = await transporter.sendMail({
-        from: process.env.EMAIL_USER,
-        to,
-        subject,
-        text: body,
-        html: `<div>${body}</div>`
-      });
+    // Try to get the cached MongoDB connection
+    const { db } = await connectToDatabase();
+    
+    // Create a new Agenda instance with the database connection
+    agenda = new Agenda({
+      mongo: db,
+      collection: 'emailJobs',
+      processEvery: '1 minute'
+    });
 
-      console.log(`Email sent: ${info.messageId} by user ${userId}`);
-      return info;
-    } catch (error) {
-      console.error('Error sending email:', error);
-      throw error;
-    }
-  });
+    // Define Agenda job for sending emails
+    agenda.define('send email', async (job) => {
+      const { to, subject, body, userId } = job.attrs.data;
+      
+      try {
+        const info = await transporter.sendMail({
+          from: process.env.EMAIL_USER,
+          to,
+          subject,
+          text: body,
+          html: `<div>${body}</div>`
+        });
 
-  await agenda.start();
-  console.log('Agenda started successfully');
+        console.log(`Email sent: ${info.messageId} by user ${userId}`);
+        return info;
+      } catch (error) {
+        console.error('Error sending email:', error);
+        throw error;
+      }
+    });
+
+    await agenda.start();
+    console.log('Agenda started successfully');
+    return agenda;
+  } catch (error) {
+    console.error('Failed to initialize Agenda:', error);
+    throw error;
+  }
 };
 
 // Define protected routes - JWT required for these routes
@@ -823,14 +867,13 @@ async function scheduleEmail({ to, subject, body, delay, unit, userId }) {
  * Start the server and connect to MongoDB
  */
 const start = async () => {
-  // Only start the server if not running in a serverless environment (Vercel)
-  if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
-    // Start Express server first
+  // Only start the Express server listener if not in serverless mode
+  if (!isVercelServerless) {
     app.listen(PORT, () => {
       console.log(`Server is running on port ${PORT}`);
     });
   } else {
-    console.log('Running in serverless mode on Vercel');
+    console.log("Running in serverless mode - no need to start server listener");
   }
   
   // Try to connect to MongoDB and initialize Agenda
@@ -841,19 +884,13 @@ const start = async () => {
     }
     
     console.log('Connecting to MongoDB with URI:', MONGODB_URI.replace(/(mongodb\+srv:\/\/[^:]+):([^@]+)/, '$1:****'));
-    const client = new MongoClient(MONGODB_URI, {
-      serverSelectionTimeoutMS: 30000, // 30 second timeout
-      connectTimeoutMS: 30000,
-      socketTimeoutMS: 45000,
-      maxPoolSize: 10,
-      retryWrites: true
-    });
     
-    await client.connect();
+    // Use the optimized connection function
+    const { client, db } = await connectToDatabase();
+    
     console.log('Connected to MongoDB successfully');
     
     // Test the connection by listing the database collections
-    const db = client.db();
     try {
       const collections = await db.listCollections().toArray();
       console.log(`Connected to database with ${collections.length} collections`);
@@ -877,6 +914,8 @@ const start = async () => {
       console.error('Make sure the MongoDB user exists and has the correct permissions.');
     } else if (error.name === 'MongoTimeoutError') {
       console.error('Connection timed out. Please check if the MongoDB server is running and accessible.');
+      console.error('If using MongoDB Atlas, ensure your IP whitelist includes 0.0.0.0/0 to allow all connections.');
+      console.error('Verify that your database user has the correct access rights.');
     } else if (error.message.includes('ECONNREFUSED')) {
       console.error('Connection refused. MongoDB server might not be running or not accessible.');
     }
@@ -885,9 +924,8 @@ const start = async () => {
   }
 };
 
-// In serverless environment, just export the app
-if (process.env.NODE_ENV === 'production' && process.env.VERCEL) {
-  // Connect to MongoDB without starting Express server
+// In serverless environment, just connect to DB without blocking
+if (isVercelServerless) {
   start().catch(error => {
     console.error('Error in serverless initialization:', error);
   });
