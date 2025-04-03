@@ -4,6 +4,16 @@
 import { exec } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import dotenv from 'dotenv';
+
+// Load environment variables
+dotenv.config();
+
+// Check if we're running in Vercel environment
+if (process.env.VERCEL) {
+  console.log('Running in Vercel environment - skipping local server startup checks');
+  process.exit(0);
+}
 
 // Check if the server is already running
 const checkServerRunning = async () => {
